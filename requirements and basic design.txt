@@ -1,0 +1,505 @@
+================================================================================
+  SIMETRA — Refined Design Document (v4)
+  .NET Core 9 · Kubernetes · SNMP Supervisor
+================================================================================
+
+1. OVERVIEW
+───────────
+  Name:         Simetra
+  Type:         Headless background service (no UI)
+  Runtime:      .NET Core 9, hosted in Kubernetes
+  Telemetry:    OTLP Collector (OpenTelemetry)
+  Scope:        One Simetra instance per site, ~5 devices (guideline, not enforced)
+  Config:       Static — appsettings.json (restart required for changes)
+  Persistence:  None — state rebuilt from next poll cycle on restart
+  Logs:         Always include site name, role (leader/follower), correlationId
+
+2. LEADER-FOLLOWER HA (Active-Passive)
+──────────────────────────────────────
+  Pattern:      Kubernetes Lease API (coordination.k8s.io/v1)
+  Lease renew:  Every ~10s, expires after ~15s
+  All pods:     Receive identical SNMP traffic (K8s Service replicates to all)
+                Execute same business logic, maintain identical internal state
+  Leader:       Sends logs + metrics (SNMP-derived + .NET runtime) + traces to OTLP
+  Followers:    Hot standbys, send logs only to OTLP
+  Failover:     Lease expires (~15s after last renew) → follower acquires (near-instant)
+                Brief gap (~15s) with no metrics/traces is acceptable
+  Graceful:     On SIGTERM, leader explicitly releases lease for near-instant failover
+  Liveness:     K8s liveness probe checks liveness vector directly — stale stamps → probe fails → pod restart
+
+3. CORRELATION ID & CORRELATION JOB
+──────────────────────────────────────
+  Quartz scheduled job ("correlation job") with configurable interval:
+    1) Generate a new shared correlationId (time-window grouping)
+    2) Stamp correlation_job tenant in liveness vector (end of execution)
+    Correlation job is just another Quartz job — same [DisallowConcurrentExecution],
+    same staleness detection, same liveness vector stamping as any other job.
+    No watchdog logic runs here — vector analysis is triggered by K8s liveness probe.
+
+  CorrelationId mechanism:
+    - On startup, the correlation generation method is called DIRECTLY once (not scheduled)
+      to ensure a correlationId exists before any other job fires (see Section 10)
+    - After startup, the Quartz correlation job generates a new correlationId each interval
+    - All components read the current correlationId when they need it:
+      - Scheduled jobs: read correlationId before execution, propagate through entire flow
+      - Traps: read correlationId on arrival at listener
+    - All traps and events within the same time window share the same correlationId
+    - Purpose: query logs by correlationId to see all events in the same time window
+
+4. PIPELINE ARCHITECTURE
+────────────────────────
+  Design patterns:
+    - Composable middleware chain (like ASP.NET middleware) for cross-cutting concerns
+      (correlationId propagation, structured logging, error handling)
+    - Channel-per-device isolation (System.Threading.Channels<T>)
+      One bounded channel per device module for thread isolation & backpressure
+      Full-mode: drop oldest (real-time approach — stale data is less valuable than current)
+      When items are dropped, log at Debug level (not per-item — channel-level notification)
+    - Strategy/plugin pattern for device modules (Open/Closed Principle)
+
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │ LAYER 1 — LISTENER                                                     │
+  │                                                                         │
+  │  Single SNMP listener for all devices                                   │
+  │  + Quartz Scheduler triggers: poll jobs, heartbeat job, correlation job │
+  │                                                                         │
+  │  Traps arrive → attach correlationId → forward to Layer 2              │
+  └─────────────────────────────────────────────────────────────────────────┘
+                          │ (traps only)
+                          ▼
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │ LAYER 2 — ROUTING & FILTERING                                          │
+  │                                                                         │
+  │  Step 1: Device Filter — identify source device by IP/identifier        │
+  │  Step 2: Trap Filter  — per-device, keep only required trap OIDs        │
+  │                                                                         │
+  │  After filtering → routed into device-specific bounded Channel<T>       │
+  │  Full isolation per device from this point forward                      │
+  │                                                                         │
+  │  Devices registered in appsettings.json (static config)                 │
+  │  "Simetra" virtual device: hardcoded heartbeat trap handler             │
+  └─────────────────────────────────────────────────────────────────────────┘
+                          │ (filtered traps via channels)
+                          ▼
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │ LAYER 3 — EXTRACTION (unified generic extractor)                        │
+  │                                                                         │
+  │  Two entry points:                                                      │
+  │    a) Filtered traps — arrive from Layer 2 via channel                  │
+  │    b) Poll responses — arrive DIRECTLY from scheduler (skip Layer 2)    │
+  │       Polls are already device-targeted, no filtering needed            │
+  │       Deliberate: polls skip channels to avoid backpressure from trap   │
+  │       floods and eliminate redundant device identification              │
+  │                                                                         │
+  │  One generic extractor — reads the Extract map from PollDefinitionDto   │
+  │  Same logic for BOTH configurable (config) and hardcoded (code) polls   │
+  │  Same logic for traps (trap definitions use same PollDefinitionDto)     │
+  │                                                                         │
+  │  SNMP varbind format (official notation):                               │
+  │    OID = Type: Value                                                    │
+  │    e.g.  1.3.6.1.2.1.2.2.1.7.1 = INTEGER: 1                           │
+  │          1.3.6.1.2.1.31.1.1.1.1.1 = STRING: "ge0/1"                   │
+  │          1.3.6.1.4.1.9999.1.3.1.0 = Gauge32: 85                       │
+  │                                                                         │
+  │  SNMP types provide automatic conversion — no manual type mapping:      │
+  │    INTEGER   → int   (enum map optional for semantics)                  │
+  │    STRING    → string                                                   │
+  │    Counter32 → number                                                   │
+  │    Counter64 → number                                                   │
+  │    Gauge32   → number                                                   │
+  │    Timeticks → number                                                   │
+  │    IpAddress → string                                                   │
+  │                                                                         │
+  │  Extract map: OID → PropertyName + optional EnumMap                     │
+  │    "1.3.6.1.2.1.2.2.1.7"    → Property: "AdminStatus"                 │
+  │                                 Enum: { 1: "Up", 2: "Down" }           │
+  │    "1.3.6.1.2.1.2.2.1.8"    → Property: "OperStatus"                  │
+  │                                 Enum: { 1: "Up", 2: "Down" }           │
+  │    "1.3.6.1.2.1.31.1.1.1.1" → Property: "InterfaceName"              │
+  │                                 (no Enum — STRING auto-typed by SNMP)  │
+  │                                                                         │
+  │  Generic extractor logic:                                               │
+  │    For each varbind in SNMP response:                                   │
+  │      (OID, Type, RawValue) = varbind    ← type comes from SNMP         │
+  │      if OID exists in Extract map:                                      │
+  │        property = Extract[OID].PropertyName                             │
+  │        if Extract[OID].Enum exists:                                     │
+  │          value = Extract[OID].Enum[RawValue]  ← INTEGER 1 → "Up"       │
+  │        else:                                                            │
+  │          value = RawValue                     ← auto-typed by SNMP      │
+  │        domainObject[property] = value                                   │
+  │                                                                         │
+  │  Both traps and poll responses produce the same domain object format    │
+  │                                                                         │
+  │  Simetra virtual device extractor — uniform, no special case:            │
+  │    Produces domain object (heartbeat data) — same as any device         │
+  │    Updates State Vector (Simetra tenant) — same as any Module source    │
+  └─────────────────────────────────────────────────────────────────────────┘
+                          │
+                          ▼
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │ LAYER 4 — PROCESSING (parallel branches, Source-based routing)          │
+  │                                                                         │
+  │  Branch A: Create metric → send to OTLP (leader only)     ← ALWAYS     │
+  │    Uses PollDefinitionDto + extracted domain object                     │
+  │    IMetricFactory enforces base labels (see Section 8 for details)      │
+  │                                                                         │
+  │  Branch B: Update State Vector                  ← ONLY if Source=Module │
+  │            (single vector, all devices,                                 │
+  │            last state only, no persistence, no TTL)                     │
+  │            Each tenant: domain object + last update timestamp +         │
+  │            correlationId (from the flow that produced the update)       │
+  │                                                                         │
+  │  Source-based routing:                                                   │
+  │    Source = Module        → Branch A (metric) + Branch B (State Vector) │
+  │    Source = Configuration → Branch A (metric) only                      │
+  └─────────────────────────────────────────────────────────────────────────┘
+
+5. DEVICE MODULES (Self-Contained Plugins)
+──────────────────────────────────────────
+  Design pattern: each device module is a self-contained plugin that encapsulates
+  ALL device-specific behavior. Config provides identity (Name, IpAddress) and
+  optional configurable metric polls (MetricPolls array).
+
+  Each device module contains (hardcoded in code):
+    - Device type identifier (e.g. "router", "switch")
+    - Trap definitions — PollDefinitionDto with Extract map (Source=Module)
+        OIDs field = trap OIDs to accept (filter); IntervalSeconds = N/A (traps are async)
+    - State poll definitions — PollDefinitionDto with Extract map (Source=Module)
+    - Bounded Channel<T> — isolation boundary
+
+  Config can also provide (per device in appsettings.json):
+    - MetricPolls[] — configurable metric polls using PollDefinitionDto (Source=Configuration)
+    - Same structure as hardcoded polls, but Source is set by system at load time
+
+  PollDefinitionDto (unified structure for polls AND trap definitions):
+    MetricName:       "simetra_port_status"
+    MetricType:       Gauge | Counter
+    OIDs:             ["1.3.6.1.2.1.2.2.1.7", "1.3.6.1.2.1.2.2.1.8"]
+                      Polls: OIDs to query  |  Traps: OIDs to accept (filter)
+    IntervalSeconds:  30    (N/A for trap definitions — traps are asynchronous)
+    Extract:          OID → { Property, optional Enum }
+    Source:           Module | Configuration    ← ON THE DTO, NOT in config
+
+  KEY DESIGN RULE — identical structure everywhere:
+    Hardcoded definitions (in device module code) use EXACTLY the same PollDefinitionDto
+    structure as definitions in the configuration file. The only difference is where they
+    live (code vs. config) and the Source field set by the system at load time.
+
+  What PollDefinitionDto provides for metric/label extraction:
+    - MetricName       → becomes the metric name reported to OTLP
+    - OIDs             → for polls: which OIDs to query the device for
+                         for traps: which OIDs to accept (filter — reject unmatched)
+    - Extract map      → OID → { PropertyName, optional EnumMap }
+                         PropertyName becomes a label name or metric value identifier
+                         (the extractor per device type determines which properties
+                         are metric values vs. labels)
+    - Base labels (per device, from config — NOT from the DTO):
+        site, device_name, device_ip, device_type
+        These are general labels attached to EVERY metric from the device
+        (see Section 8 — IMetricFactory auto-attaches them)
+
+  Source field:
+    - Exists on the DTO — NOT exposed in appsettings.json
+    - Set automatically by the system at load time:
+      Loaded from config → Source = Configuration → metric only (no State Vector)
+      Loaded from code   → Source = Module        → metric + State Vector
+    - Developer cannot override Source — behavior determined by where definition lives
+
+  Three definition categories (same DTO, different origin/behavior):
+    ┌───────────────────────┬────────────────────────┬────────────────────────┬────────────────────────┐
+    │                       │ Trap Defs (hardcoded)   │ State Polls (hardcoded)│ Metric Polls (config)  │
+    ├───────────────────────┼────────────────────────┼────────────────────────┼────────────────────────┤
+    │ Definition lives in   │ Device module code     │ Device module code     │ appsettings.json       │
+    │ DTO structure         │ PollDefinitionDto      │ PollDefinitionDto      │ PollDefinitionDto      │
+    │ Source (set by system)│ Module                 │ Module                 │ Configuration          │
+    │ Extractor             │ Generic (reads Extract)│ Generic (reads Extract)│ Generic (reads Extract)│
+    │ Metric → OTLP         │ ✓                      │ ✓                      │ ✓                      │
+    │ State Vector update   │ ✓                      │ ✓                      │ ✗                      │
+    │ Code change needed    │ Yes                    │ Yes                    │ No — config only       │
+    │ Purpose               │ Trap handling          │ Production monitoring  │ Discovery / validation │
+    └───────────────────────┴────────────────────────┴────────────────────────┴────────────────────────┘
+
+  Migration path (configurable → hardcoded):
+    1) Developer adds metric poll in config (with Extract map) → validates OIDs, interval, extracted values
+    2) Promotes to code → moves same PollDefinitionDto to device module
+    3) System sets Source = Module → now updates State Vector
+    4) Removes config entry
+    Minimal effort: same structure, just move definition from config to code
+
+  What IS in config (appsettings.json, per device):
+    - Name — device identifier
+    - IpAddress — device IP (for device filter + poll target)
+    - DeviceType — binds config entry to device module (e.g. "router", "switch")
+    - MetricPolls[] — optional configurable metric polls (PollDefinitionDto)
+
+  Adding a new device (Open/Closed Principle):
+    1) Create new device module class (device type + trap definitions + state polls + channel)
+    2) Add config entry in appsettings.json (Name + IpAddress + DeviceType + optional MetricPolls)
+    3) Register module in pipeline
+    4) Restart application
+    → No existing code changes required
+
+  Virtual device — "Simetra" (hardcoded):
+    - Uses the same config structure as real devices (Name, IpAddress, DeviceType)
+      but hardcoded in code — not defined in appsettings.json Devices[] array
+    - Trap definition: PollDefinitionDto accepting only heartbeat OID (Source=Module)
+    - Extractor: produces domain object (heartbeat data) — same as any device
+    - Processing: metric (Branch A) + State Vector update (Branch B) — fully uniform
+    - Job completion: stamps liveness vector — same as any job
+    - Uniform pipeline — no special-case if/else branches
+
+6. HEALTH MONITORING
+────────────────────
+  Liveness Vector:
+    - One entry per scheduled job (including the correlation job)
+    - All jobs: stamped at end of every job completion
+    - NOT stamped by incoming device traps (only scheduled jobs)
+    - Purpose: detect flow hangs, silent exceptions, and job stalls (not business logic)
+
+  Heartbeat (loopback):
+    - Scheduled job sends heartbeat trap TO the SNMP listener
+    - Validates listener is alive and pipeline is flowing
+    - Flows through full pipeline as "Simetra" virtual device — fully uniform
+    - Extractor produces domain object + State Vector update (same as any device)
+    - Two separate stamps (different vectors, different purposes):
+        1) Heartbeat SEND job stamps liveness vector on completion (proves scheduler is alive)
+           — same as any scheduled job; checked by liveness probe
+        2) Heartbeat ARRIVAL through pipeline updates "Simetra" tenant in State Vector
+           (proves listener + pipeline are flowing)
+           — liveness probe does NOT check State Vector; this stamp is currently informational only
+           — Future milestone: State Vector staleness checking will detect a dead listener
+
+  Liveness — probe-driven vector check (no separate watchdog):
+    - NO watchdog runs in the correlation job — vector analysis is triggered ON DEMAND by K8s
+    - K8s liveness probe calls HTTP handler (runs on ASP.NET thread pool, independent of Quartz jobs)
+    - HTTP handler iterates liveness vector, checks each tenant stamp < (tenant's own interval × GraceMultiplier)
+    - Any tenant stale → 503 + log diagnostic (which tenant, how stale)
+    - All healthy → 200 (silent — no log)
+    - If HTTP handler itself hangs → K8s timeoutSeconds catches it → restart
+    - Correlation job is a tenant too — if stuck, its stamp goes stale → probe detects
+
+    Detection matrix (current milestone):
+      Pipeline stuck (job/channel)    → job tenant stamp stale     → liveness probe detects
+      Correlation job stuck            → correlation_job tenant stale → liveness probe detects
+      HTTP handler stuck              → K8s timeoutSeconds          → K8s detects (no response)
+      Listener down                   → NOT detected by liveness probe (send job still completes over UDP)
+                                         State Vector staleness checking (future milestone) will close this gap
+
+  K8s Probes (three distinct probes, no overlap):
+    Startup probe:
+      - Returns healthy ONCE after pipeline is fully wired and first correlationId exists
+      - K8s delays liveness/readiness checks until startup probe succeeds
+      - If startup probe never succeeds within failureThreshold × periodSeconds → K8s kills pod
+    Readiness probe:
+      - Gated by startup probe — not checked until startup succeeds
+      - Checks: all device channels open (not disposed/faulted) + Quartz scheduler running
+      - No listener check in current milestone — covered indirectly by heartbeat liveness tenant
+        Future milestone: readiness probe will also include direct listener health check
+      - If not ready → K8s removes pod from Service → stops receiving SNMP traffic
+    Liveness probe:
+      - Gated by startup probe — not checked until startup succeeds
+      - HTTP handler checks liveness vector directly (no watchdog intermediary)
+      - Runs at K8s periodSeconds frequency (e.g., every 10s), not every correlation job execution
+      - Includes heartbeat SEND tenant → validates scheduler fires heartbeat job
+        (does NOT validate listener is alive — send job completes over UDP regardless)
+        Future milestone: State Vector staleness check will detect dead listener
+      - Includes correlation_job tenant → validates correlation job is alive
+      - Stale stamps → probe fails → K8s restarts pod
+
+7. SCHEDULED JOBS (Quartz)
+──────────────────────────
+  Concurrency policy:
+    - [DisallowConcurrentExecution] per job key
+    - Same job type CANNOT overlap: if previous instance still running, next trigger is SKIPPED
+    - Different job types CAN run concurrently (e.g., Device A poll + Device B poll)
+    - Skipped job = no new stamp → liveness probe detects stale stamp → hang detection
+    - Traps flow independently of scheduled jobs (not blocked by them)
+
+  Jobs:
+    - SNMP State Poll (per device, Source=Module) — hardcoded in device module code
+      Polls device, response → Layer 3 extractor → metric + State Vector
+    - SNMP Metric Poll (per device, Source=Configuration) — from config MetricPolls[]
+      Polls device, response → Layer 3 extractor → metric only (no State Vector)
+    - Heartbeat — sends loopback trap to listener
+    - Correlation Job — generates new correlationId + stamps liveness vector
+    - All poll jobs use same PollDefinitionDto and same generic extractor
+    - All jobs: get correlationId before execution, stamp liveness vector on completion
+
+8. TELEMETRY (OTLP)
+────────────────────
+  Leader:   logs + metrics + traces (SNMP-derived + .NET runtime)
+  Follower: logs only
+  All logs: site name, role, correlationId
+  Metrics:  created in Layer 4 Branch A from extracted objects
+  Console:  configurable via Logging:EnableConsole flag (sends logs to stdout too)
+
+  SNMP-derived metric ownership split:
+    PollDefinitionDto provides:
+      metric name  — from DTO (e.g. simetra_port_status)
+      metric type  — from DTO (gauge, counter)
+
+    Extracted domain object provides:
+      metric value — from SNMP values, built by the extractor per device type
+                     (the extractor determines which extracted properties map to
+                     metric values vs. labels based on the PollDefinitionDto)
+      extra labels — from Extract map output (e.g. interface_name="ge0/1")
+
+    IMetricFactory auto-attaches common base labels to every metric:
+      site         — Site:Name config
+      device_name  — Devices[n]:Name config
+      device_ip    — Devices[n]:IpAddress config
+      device_type  — Devices[n]:DeviceType config (binds to device module)
+    Enforced by framework. Device modules cannot skip or rename base labels.
+    Enables uniform queries/dashboards across all devices:
+      e.g. {site="site-nyc-01", device_name="router-core-1"}
+
+  .NET Runtime Metrics (leader only):
+    Built-in meters via OpenTelemetry .NET runtime instrumentation.
+    Exported to OTLP through the same MeterProvider — leader-only gating
+    applies automatically (OTLP metric exporter active on leader, inactive on followers).
+    Examples:
+      process.cpu.time, process.memory.usage,
+      dotnet.gc.heap.size, dotnet.gc.collections.count,
+      dotnet.thread_pool.queue.length, dotnet.thread_pool.thread.count
+    Labels: site (auto-attached) — no device labels (process-level metrics)
+    No custom code needed — enabled by OpenTelemetry .NET instrumentation packages
+
+9. CONFIGURATION (appsettings.json)
+────────────────────────────────────
+  Static config — restart required for changes.
+  State polls, trap definitions, extractors are hardcoded in device module code.
+  Configurable metric polls are defined per device in MetricPolls[] array.
+
+  Site:
+    Name                          — site identifier (included in all logs)
+    PodIdentity                   — pod name (defaults to HOSTNAME env var)
+
+  Lease:
+    Name                          — K8s Lease resource name
+    Namespace                     — K8s namespace for the lease
+    RenewIntervalSeconds          — how often leader renews (default: 10)
+    DurationSeconds               — lease TTL before expiry (default: 15)
+
+  CorrelationJob:
+    IntervalSeconds               — correlationId generation + correlation_job stamp interval (default: 30)
+
+  SnmpListener:
+    BindAddress                   — IP to bind the listener (default: 0.0.0.0)
+    Port                          — UDP port for traps (default: 162)
+    CommunityString               — SNMP community string
+    Version                       — SNMP version (v2c only — SNMPv3 not supported)
+
+  HeartbeatJob:
+    IntervalSeconds               — how often heartbeat is sent (default: 15)
+    (OID is hardcoded in Simetra module's trap definition — send job reads it from there, single source of truth)
+    (private case: heartbeat trap is sent locally to the listener, not from an external device)
+
+  Liveness:
+    GraceMultiplier               — multiplier for stale stamp detection (default: 2)
+
+  Channels:
+    BoundedCapacity               — max items per device channel (default: 100)
+
+  Devices[] (array, ~5 guideline — not enforced):
+    Name                          — device identifier
+    IpAddress                     — device IP (for device filter + poll target)
+    DeviceType                    — device type identifier (binds config entry to device module, e.g. "router", "switch")
+    MetricPolls[] (optional)      — configurable metric polls (PollDefinitionDto)
+      Each entry:
+        MetricName                — metric name (e.g. "simetra_cpu_utilization")
+        MetricType                — Gauge | Counter
+        OIDs[]                    — list of OIDs to poll
+        IntervalSeconds           — poll interval
+        Extract                   — OID → { Property, optional Enum } mapping
+      Note: Source field is NOT in config — system sets Source=Configuration at load time
+    (state polls, trap filters, extractors are hardcoded in device module code)
+
+  Otlp:
+    Endpoint                      — OTLP collector endpoint
+    ServiceName                   — service name for traces/metrics
+
+  Logging:
+    LogLevel:Default              — default log level (default: Information)
+    EnableConsole                  — send logs to console/stdout (default: false)
+
+10. STARTUP SEQUENCE
+─────────────────────
+  All pods execute the same startup sequence. Role (leader/follower) is determined
+  after startup, and only affects which OTLP exporters are active.
+
+  Steps:
+    1) Load config            — read appsettings.json (static, immutable after this)
+    2) Register device modules — each module provides:
+                                  device type, trap definition DTOs (Source=Module),
+                                  state poll DTOs (Source=Module), channel
+    3) Load metric polls      — deserialize MetricPolls[] per device from config
+                                  system sets Source=Configuration on each DTO
+    4) Merge poll definitions — combine hardcoded (Source=Module) + configurable (Source=Configuration)
+                                  into unified list per device
+    5) Wire pipeline          — SNMP listener, bounded channels, generic extractor, processing branches
+    6) Configure telemetry    — OpenTelemetry MeterProvider (.NET runtime + SNMP-derived meters)
+                                  log exporter (active on ALL pods — leader and followers)
+                                  metric + trace exporters (gated by role — leader only)
+    7) Start SNMP listener    — begin receiving traps (queued in channels)
+    8) Generate first correlationId — call correlation generation method DIRECTLY (not scheduled)
+                                  ensures a correlationId exists before any job fires
+    9) Schedule Quartz jobs   — register poll jobs (one per PollDefinitionDto per device)
+                                  register heartbeat job
+                                  register correlation job (takes over periodic correlationId generation)
+   10) Begin lease loop       — attempt to acquire K8s Lease
+                                  leader: activates metric + trace exporters
+                                  follower: logs only, waits for lease availability
+   11) Mark startup probe     — verifies correlationId exists, then startup probe returns healthy
+                                  K8s now starts liveness/readiness checks
+
+  Notes:
+    - Log exporter is always active (all pods, from step 6 onward)
+    - Metric + trace exporters activate dynamically based on lease role (step 10)
+    - Role can change at runtime (follower → leader on failover) — exporter gating is dynamic
+    - Startup probe gates liveness — K8s won't kill a slow-starting pod prematurely
+
+  Shutdown (SIGTERM — CancellationToken + time budget):
+    All steps share a CancellationToken that fires when the host shutdown timeout expires.
+    Each step has a bounded time budget — if exceeded, abandon and move on.
+    Budget is a fraction of terminationGracePeriodSeconds (default 30s), not hardcoded.
+
+    1) Release lease             — budget: ~1s (network call to K8s API)
+         if leader: near-instant failover to follower
+         if follower: no-op
+    2) Stop SNMP listener        — instant
+         clean intake cutoff — no new items can enter channels
+         K8s already removed pod from Service endpoints at SIGTERM
+    3) Stop Quartz scheduler     — budget: ~8s
+         stops correlation job + all poll jobs + heartbeat job
+         no NEW jobs fire
+         in-flight jobs: signal CancellationToken, wait up to budget
+         jobs SHOULD check token between retries / varbind processing
+         if timeout: abandon (jobs killed on process exit)
+         poll responses flow synchronously on the Quartz thread: extractor → processing
+           (polls skip channels — no overlap with step 4 channel drain)
+         in-flight heartbeat: fails silently (listener already down — fine)
+    4) Drain bounded channels    — budget: ~8s
+         channels contain only trap items (polls never enter channels)
+         mark channels complete-for-writing (no new items — listener already stopped)
+         consumers process remaining items, respecting CancellationToken
+         each item → extractor → processing (trap filter already applied in Layer 2 before channel)
+         if timeout: abandon remaining items
+         no race with step 3 — polls complete synchronously before drain begins
+    5) Flush telemetry           — budget: ~5s
+         MUST run — captures shutdown diagnostics
+         remaining ~8s reserved for OS cleanup / SIGKILL margin
+
+    Budget total: ~1s + ~0s + ~8s + ~8s + ~5s + ~8s margin = ~30s (terminationGracePeriodSeconds)
+
+    Why this order matters:
+      - Lease released FIRST: allows near-instant failover before any other shutdown work.
+      - Listener stops BEFORE scheduler: poll responses skip Layer 2 (direct to extractor),
+        so in-flight polls don't need the listener. Only heartbeat loopback needs listener,
+        and that's irrelevant during shutdown.
+      - Telemetry flush is PROTECTED: gets its own budget regardless of whether steps 3-4
+        completed or timed out. Ensures diagnostic logs explaining WHY the pod was killed
+        are not lost.
+      - Healthy shutdown: jobs complete fast, channels drain fast, plenty of time for flush.
+      - Unhealthy shutdown (from liveness failure): stuck work gets cancelled via token,
+        telemetry still flushes with diagnostic logs.
