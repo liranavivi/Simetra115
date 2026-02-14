@@ -91,7 +91,7 @@
   │       Deliberate: polls skip channels to avoid backpressure from trap   │
   │       floods and eliminate redundant device identification              │
   │                                                                         │
-  │  One generic extractor — reads OidsToAccept from PollDefinitionDto      │
+  │  One generic extractor — reads Oids from PollDefinitionDto              │
   │  Same logic for BOTH configurable (config) and hardcoded (code) polls   │
   │  Same logic for traps (trap definitions use same PollDefinitionDto)     │
   │                                                                         │
@@ -110,7 +110,7 @@
   │    Timeticks → number                                                   │
   │    IpAddress → string                                                   │
   │                                                                         │
-  │  OidsToAccept[] — each entry: OID + PropertyName + optional EnumMap     │
+  │  Oids[] — each entry: OID + PropertyName + optional EnumMap             │
   │    { OID: "1.3.6.1.2.1.2.2.1.7",    Property: "AdminStatus",          │
   │      Enum: { 1: "Up", 2: "Down" } }                                    │
   │    { OID: "1.3.6.1.2.1.2.2.1.8",    Property: "OperStatus",           │
@@ -121,7 +121,7 @@
   │  Generic extractor logic:                                               │
   │    For each varbind in SNMP response:                                   │
   │      (OID, Type, RawValue) = varbind    ← type comes from SNMP         │
-  │      find entry in OidsToAccept where entry.OID matches varbind OID:    │
+  │      find entry in Oids where entry.OID matches varbind OID:            │
   │        property = entry.PropertyName                                    │
   │        if entry.Enum exists:                                            │
   │          value = entry.Enum[RawValue]  ← INTEGER 1 → "Up"              │
@@ -163,9 +163,9 @@
 
   Each device module contains (hardcoded in code):
     - Device type identifier (e.g. "router", "switch")
-    - Trap definitions — PollDefinitionDto with OidsToAccept (Source=Module)
-        OidsToPoll = N/A; IntervalSeconds = N/A (traps are async)
-    - State poll definitions — PollDefinitionDto with OidsToAccept (Source=Module)
+    - Trap definitions — PollDefinitionDto with Oids (Source=Module)
+        IntervalSeconds = N/A (traps are async)
+    - State poll definitions — PollDefinitionDto with Oids (Source=Module)
     - Bounded Channel<T> — isolation boundary
 
   Config can also provide (per device in appsettings.json):
@@ -175,11 +175,11 @@
   PollDefinitionDto (unified structure for polls AND trap definitions):
     MetricName:       "simetra_port_status"
     MetricType:       Gauge | Counter
-    OidsToPoll:       ["1.3.6.1.2.1.2.2.1.7", "1.3.6.1.2.1.2.2.1.8"]
-                      (poll-only — which OIDs to query; N/A for trap definitions)
+    Oids:             [{ OID, PropertyName, optional EnumMap }]
+                      For polls: system derives OIDs to query from Oids[].OID
+                      For traps: filter — reject varbinds with unmatched OIDs
+                      For both:  extraction instructions (PropertyName + optional Enum)
     IntervalSeconds:  30    (poll-only — N/A for trap definitions)
-    OidsToAccept:     [{ OID, PropertyName, optional EnumMap }]
-                      (shared — both polls and traps; filter for traps, extraction for both)
     Source:           Module | Configuration    ← ON THE DTO, NOT in config
 
   KEY DESIGN RULE — identical structure everywhere:
@@ -189,8 +189,8 @@
 
   What PollDefinitionDto provides for metric/label extraction:
     - MetricName       → becomes the metric name reported to OTLP
-    - OidsToPoll       → for polls: which OIDs to query the device for (N/A for traps)
-    - OidsToAccept     → each entry: { OID, PropertyName, optional EnumMap }
+    - Oids             → each entry: { OID, PropertyName, optional EnumMap }
+                         For polls: system derives which OIDs to query from Oids[].OID
                          For traps: filter — reject varbinds with unmatched OIDs
                          For both:  extraction — PropertyName becomes a label name or
                          metric value identifier (the extractor per device type determines
@@ -214,7 +214,7 @@
     │ Definition lives in   │ Device module code     │ Device module code     │ appsettings.json       │
     │ DTO structure         │ PollDefinitionDto      │ PollDefinitionDto      │ PollDefinitionDto      │
     │ Source (set by system)│ Module                 │ Module                 │ Configuration          │
-    │ Extractor             │ Generic (OidsToAccept) │ Generic (OidsToAccept) │ Generic (OidsToAccept) │
+    │ Extractor             │ Generic (reads Oids)   │ Generic (reads Oids)   │ Generic (reads Oids)   │
     │ Metric → OTLP         │ ✓                      │ ✓                      │ ✓                      │
     │ State Vector update   │ ✓                      │ ✓                      │ ✗                      │
     │ Code change needed    │ Yes                    │ Yes                    │ No — config only       │
@@ -222,7 +222,7 @@
     └───────────────────────┴────────────────────────┴────────────────────────┴────────────────────────┘
 
   Migration path (configurable → hardcoded):
-    1) Developer adds metric poll in config (with OidsToAccept) → validates OIDs, interval, extracted values
+    1) Developer adds metric poll in config (with Oids) → validates OIDs, interval, extracted values
     2) Promotes to code → moves same PollDefinitionDto to device module
     3) System sets Source = Module → now updates State Vector
     4) Removes config entry
@@ -344,7 +344,7 @@
       metric value — from SNMP values, built by the extractor per device type
                      (the extractor determines which extracted properties map to
                      metric values vs. labels based on the PollDefinitionDto)
-      extra labels — from OidsToAccept entries (e.g. interface_name="ge0/1")
+      extra labels — from Oids entries (e.g. interface_name="ge0/1")
 
     IMetricFactory auto-attaches common base labels to every metric:
       site         — Site:Name config
@@ -369,7 +369,7 @@
 9. CONFIGURATION (appsettings.json)
 ────────────────────────────────────
   Static config — restart required for changes.
-  State polls and trap definitions (with OidsToAccept) are hardcoded in device module code.
+  State polls and trap definitions (with Oids) are hardcoded in device module code.
   Configurable metric polls are defined per device in MetricPolls[] array.
 
   Site:
@@ -410,11 +410,11 @@
       Each entry:
         MetricName                — metric name (e.g. "simetra_cpu_utilization")
         MetricType                — Gauge | Counter
-        OidsToPoll[]              — list of OIDs to poll
+        Oids[]                    — array of { OID, Property, optional Enum }
         IntervalSeconds           — poll interval
-        OidsToAccept[]            — array of { OID, Property, optional Enum }
       Note: Source field is NOT in config — system sets Source=Configuration at load time
-    (state polls and trap definitions with OidsToAccept are hardcoded in device module code)
+      Note: OIDs to poll are derived by the system from Oids[].OID — no separate field needed
+    (state polls and trap definitions with Oids are hardcoded in device module code)
 
   Otlp:
     Endpoint                      — OTLP collector endpoint
